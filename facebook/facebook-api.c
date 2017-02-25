@@ -1323,16 +1323,27 @@ fb_api_xma_parse(FbApi *api, const gchar *body, JsonNode *root, GError **error)
 {
     const gchar *str;
     const gchar *url;
+    const gchar *title;
+    gdouble lat;
+    gdouble lon;
     FbHttpValues *prms;
     FbJsonValues *values;
     gchar *text;
+    gchar *temp;
     GError *err = NULL;
+    FbApiPrivate *priv = api->priv;
 
     values = fb_json_values_new(root);
     fb_json_values_add(values, FB_JSON_TYPE_STR, FALSE,
                        "$.story_attachment.target.__type__.name");
     fb_json_values_add(values, FB_JSON_TYPE_STR, FALSE,
                        "$.story_attachment.url");
+    fb_json_values_add(values, FB_JSON_TYPE_DBL, FALSE,
+                       "$.story_attachment.target.coordinates.latitude");
+    fb_json_values_add(values, FB_JSON_TYPE_DBL, FALSE,
+                       "$.story_attachment.target.coordinates.longitude");
+    fb_json_values_add(values, FB_JSON_TYPE_STR, FALSE,
+                       "$.story_attachment.title");
     fb_json_values_update(values, &err);
 
     if (G_UNLIKELY(err != NULL)) {
@@ -1343,9 +1354,12 @@ fb_api_xma_parse(FbApi *api, const gchar *body, JsonNode *root, GError **error)
 
     str = fb_json_values_next_str(values, NULL);
     url = fb_json_values_next_str(values, NULL);
+    lat = fb_json_values_next_dbl(values, 0.0);
+    lon = fb_json_values_next_dbl(values, 0.0);
+    title = fb_json_values_next_str(values, NULL);
 
     if ((str == NULL) || (url == NULL)) {
-        text = g_strdup("<Unsupported Attachment>");
+        text = g_strdup("{\"type\":\"UNSUPPORTED\"}");
         g_object_unref(values);
         return text;
     }
@@ -1354,21 +1368,28 @@ fb_api_xma_parse(FbApi *api, const gchar *body, JsonNode *root, GError **error)
         prms = fb_http_values_new();
         fb_http_values_parse(prms, url, TRUE);
         if (g_str_has_prefix(url, FB_API_FBRPC_PREFIX)) {
-            text = fb_http_values_dup_str(prms, "target_url", NULL);
+            temp = fb_http_values_dup_str(prms, "target_url", NULL);
         } else {
-            text = fb_http_values_dup_str(prms, "u", NULL);
+            temp = fb_http_values_dup_str(prms, "u", NULL);
         }
+        text = g_strdup_printf("{\"type\":\"TEXT\", \"msg\":\"%s\" }", temp);
         fb_http_values_free(prms);
     } else {
-        text = g_strdup(url);
+        prms = fb_http_values_new();
+        fb_http_values_parse(prms, url, TRUE);
+        temp = g_uri_unescape_string(fb_http_values_dup_str(prms, "u", NULL), NULL);
+        text = g_strdup_printf("{\"type\":\"LOCATION\", \"name\":\"%s\", \"lat\":%f, \"long\":%f, \"url\":\"%s\" }", title, lat, lon, temp);
+        fb_http_values_free(prms);
     }
 
-    if (fb_http_urlcmp(body, text, FALSE)) {
+    if ( fb_http_urlcmp(body, temp, FALSE) || g_strcmp0(temp, "") == 0 ) {
+        g_free(temp);
         g_free(text);
         g_object_unref(values);
         return NULL;
     }
 
+    g_free(temp);
     g_object_unref(values);
     return text;
 }
@@ -1557,6 +1578,7 @@ fb_api_cb_publish_ms_new_message(FbApi *api, JsonNode *root, GSList *msgs, GErro
 {
     const gchar *body;
     const gchar *str;
+    gchar *temp;
     GError *err = NULL;
     FbApiPrivate *priv = api->priv;
     FbApiMessage *dmsg;
@@ -1619,8 +1641,12 @@ fb_api_cb_publish_ms_new_message(FbApi *api, JsonNode *root, GSList *msgs, GErro
 
         if (body != NULL) {
             dmsg = fb_api_message_dup(&msg, FALSE);
-            dmsg->text = g_strdup(body);
-            msgs = g_slist_prepend(msgs, dmsg);
+            temp = g_strescape(body, NULL);
+            if ( g_strcmp0(temp, "") != 0 ) {
+              dmsg->text = g_strdup_printf("{\"type\":\"TEXT\", \"msg\":\"%s\" }", temp);
+              msgs = g_slist_prepend(msgs, dmsg);
+            }
+            g_free(temp);
         }
 
         id = fb_json_values_next_int(values, 0);
@@ -1986,6 +2012,7 @@ static void
 fb_api_cb_attach(FbHttpRequest *req, gpointer data)
 {
     const gchar *str;
+    const gchar *url;
     FbApi *api = data;
     FbApiMessage *msg;
     FbJsonValues *values;
@@ -2003,6 +2030,7 @@ fb_api_cb_attach(FbHttpRequest *req, gpointer data)
 
     values = fb_json_values_new(root);
     fb_json_values_add(values, FB_JSON_TYPE_STR, TRUE, "$.filename");
+    fb_json_values_add(values, FB_JSON_TYPE_STR, FALSE, "$.content_type");
     fb_json_values_add(values, FB_JSON_TYPE_STR, TRUE, "$.redirect_uri");
     fb_json_values_update(values, &err);
 
@@ -2024,7 +2052,19 @@ fb_api_cb_attach(FbHttpRequest *req, gpointer data)
     }
 
     g_free(name);
-    msg->text = fb_json_values_next_str_dup(values, NULL);
+    str = fb_json_values_next_str(values, NULL);
+    url = fb_json_values_next_str(values, NULL);
+
+    if ( msg->flags & FB_API_MESSAGE_FLAG_IMAGE ) {
+      str  = g_strrstr(url, "?");
+      name = &g_strrstr_len(url, str - url, ".")[1];
+      name = g_strndup(name, str - name);
+      msg->text = g_strdup_printf("{\"type\":\"ATTACHMENT\", \"content_type\":\"image/%s\", \"url\":\"%s\" }", name, url);
+      g_free(name);
+    } else {
+      msg->text = g_strdup_printf("{\"type\":\"ATTACHMENT\", \"content_type\":\"%s\", \"url\":\"%s\" }", str, url);
+    }
+
     msgs = g_slist_prepend(msgs, msg);
 
     g_signal_emit_by_name(api, "messages", msgs);
@@ -2606,6 +2646,7 @@ fb_api_cb_unread_msgs(FbHttpRequest *req, gpointer data)
     FbId tid;
     FbJsonValues *values;
     gchar *xma;
+    gchar *temp;
     GError *err = NULL;
     GSList *msgs = NULL;
     JsonNode *node;
@@ -2667,8 +2708,12 @@ fb_api_cb_unread_msgs(FbHttpRequest *req, gpointer data)
 
         if (body != NULL) {
             dmsg = fb_api_message_dup(&msg, FALSE);
-            dmsg->text = g_strdup(body);
-            msgs = g_slist_prepend(msgs, dmsg);
+            temp = g_strescape(body, NULL);
+            if ( g_strcmp0(temp, "") != 0 ) {
+              dmsg->text = g_strdup_printf("{\"type\":\"TEXT\", \"msg\":\"%s\" }", temp);
+              msgs = g_slist_prepend(msgs, dmsg);
+            }
+            g_free(temp);
         }
 
         str = fb_json_values_next_str(values, NULL);
@@ -2830,7 +2875,7 @@ fb_api_cb_sticker(FbHttpRequest *req, gpointer data)
 
     msg = fb_api_data_take(api, req);
     msg->flags |= FB_API_MESSAGE_FLAG_IMAGE;
-    msg->text = fb_json_values_next_str_dup(values, NULL);
+    msg->text = g_strdup_printf("{\"type\":\"ATTACHMENT\", \"content_type\":\"image/png\", \"url\":\"%s\" }", fb_json_values_next_str(values, NULL));
     msgs = g_slist_prepend(msgs, msg);
 
     g_signal_emit_by_name(api, "messages", msgs);
